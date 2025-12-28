@@ -46,10 +46,10 @@ python data/landscape.py
 ### Generate Landscape
 
 ```python
-from data.landscape import FourModeLandscape
+from data.landscape import create_four_mode_landscape
 
 # Create landscape
-landscape = FourModeLandscape(scale=2.0, std=0.5)
+landscape = create_four_mode_landscape(scale=2.0, std=0.5)
 
 # Visualize
 landscape.visualize(save_path="landscape.png")

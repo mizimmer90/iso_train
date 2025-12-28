@@ -3,7 +3,7 @@ Quick test script to verify the basic setup works.
 """
 
 import torch
-from data.landscape import FourModeLandscape
+from data.landscape import create_four_mode_landscape, FourModeLandscape
 from models.ddpm import DDPM, MLPScoreNetwork
 
 def test_landscape():
