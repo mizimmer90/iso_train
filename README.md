@@ -73,7 +73,7 @@ ddpm = DDPM(score_network, num_timesteps=1000, device="cpu")
 loss = ddpm.loss(x_start)
 
 # Generate samples (trajectory returned; final sample at [-1])
-traj = ddpm.sde_sample((batch_size, 2))
+traj = ddpm.sample((batch_size, 2), mode="sde")  # or mode="ode" for deterministic sampling
 samples = traj[-1]
 ```
 

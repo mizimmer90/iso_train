@@ -207,32 +207,6 @@ class DDPM:
         x_t = mean_coeff * x_start + std * noise
         return x_t, noise
     
-    def _reverse_sde_step(
-        self,
-        x: torch.Tensor,
-        t: torch.Tensor,
-        dt: float
-    ) -> torch.Tensor:
-        """One Euler-Maruyama step of the reverse-time VP-SDE."""
-        beta_t = self._beta(t).unsqueeze(1)
-        score = self.score_network(x, t)
-        drift = -0.5 * beta_t * x - beta_t * score
-        diffusion = torch.sqrt(torch.clamp(beta_t, min=1e-12))
-        noise = torch.randn_like(x)
-        return x + drift * dt + diffusion * math.sqrt(-dt) * noise
-
-    def _probability_flow_step(
-        self,
-        x: torch.Tensor,
-        t: torch.Tensor,
-        dt: float
-    ) -> torch.Tensor:
-        """One Euler step of the probability-flow ODE (deterministic sampler)."""
-        beta_t = self._beta(t).unsqueeze(1)
-        score = self.score_network(x, t)
-        drift = -0.5 * beta_t * x - 0.5 * beta_t * score
-        return x + drift * dt
-
     def _prepare_time_grid(
         self,
         t_span: Tuple[float, float],
@@ -262,16 +236,17 @@ class DDPM:
 
         return times, dt, num_steps
 
-    def sde_sample(
+    def sample(
         self,
         shape: Optional[Tuple[int, ...]] = None,
         x: Optional[torch.Tensor] = None,
         t_span: Tuple[float, float] = (1.0, 0.0),
         num_steps: Optional[int] = None,
         num_total_steps: Optional[int] = None,
+        mode: str = "sde",
     ) -> torch.Tensor:
         """
-        Sample using the reverse SDE (stochastic Euler-Maruyama).
+        Sample using the reverse process with either the SDE (stochastic) or ODE (deterministic).
 
         Args:
             shape: Shape to initialize noise if x is None
@@ -279,10 +254,15 @@ class DDPM:
             t_span: (t_start, t_end) for denoising
             num_steps: Explicit discretization steps
             num_total_steps: Steps per unit time span (num_steps = |t_end-t_start| * num_total_steps)
+            mode: "sde" for Euler-Maruyama sampling, "ode" for probability-flow ODE
         
         Returns:
             Trajectory tensor of shape (steps+1, batch, dims)
         """
+        mode = mode.lower()
+        if mode not in {"sde", "ode"}:
+            raise ValueError(f"Unsupported sampling mode '{mode}'. Use 'sde' or 'ode'.")
+
         self.score_network.eval()
 
         if x is None:
@@ -294,66 +274,25 @@ class DDPM:
 
         batch_size = shape[0]
         times, dt_resolved, steps = self._prepare_time_grid(t_span, num_steps, num_total_steps)
-
         traj = [x]
 
-        noise_scale = math.sqrt(abs(dt_resolved))
-        for i in range(steps):
-            t = torch.full((batch_size,), times[i], device=self.device)
-            # Reuse step but override dt for noise scale
-            beta_t = self._beta(t).unsqueeze(1)
-            score = self.score_network(x, t)
-            drift = -0.5 * beta_t * x - beta_t * score
-            diffusion = torch.sqrt(torch.clamp(beta_t, min=1e-12))
-            noise = torch.randn_like(x)
-            x = x + drift * dt_resolved + diffusion * noise_scale * noise
-
-            traj.append(x)
-
-        self.score_network.train()
-        return torch.stack(traj)
-
-    def ode_sample(
-        self,
-        shape: Optional[Tuple[int, ...]] = None,
-        x: Optional[torch.Tensor] = None,
-        t_span: Tuple[float, float] = (1.0, 0.0),
-        num_steps: Optional[int] = None,
-        num_total_steps: Optional[int] = None,
-    ) -> torch.Tensor:
-        """
-        Sample using the probability-flow ODE (deterministic; DDIM-like).
-
-        Args:
-            shape: Shape to initialize noise if x is None
-            x: Optional starting samples; if None, start from noise
-            t_span: (t_start, t_end) for denoising
-            num_steps: Explicit discretization steps
-            num_total_steps: Steps per unit time span (num_steps = |t_end-t_start| * num_total_steps)
-        
-        Returns:
-            Trajectory tensor of shape (steps+1, batch, dims)
-        """
-        self.score_network.eval()
-
-        if x is None:
-            if shape is None:
-                raise ValueError("Either x or shape must be provided for sampling.")
-            x = torch.randn(shape, device=self.device)
-        else:
-            shape = x.shape
-
-        batch_size = shape[0]
-        times, dt_resolved, steps = self._prepare_time_grid(t_span, num_steps, num_total_steps)
-
-        traj = [x]
+        # Shared drift, with mode-specific scaling on the score term
+        score_scale = 1.0 if mode == "sde" else 0.5
+        noise_scale = math.sqrt(abs(dt_resolved)) if mode == "sde" else None
 
         for i in range(steps):
             t = torch.full((batch_size,), times[i], device=self.device)
             beta_t = self._beta(t).unsqueeze(1)
             score = self.score_network(x, t)
-            drift = -0.5 * beta_t * x - 0.5 * beta_t * score
-            x = x + drift * dt_resolved
+            drift = -0.5 * beta_t * x - score_scale * beta_t * score
+
+            if mode == "sde":
+                diffusion = torch.sqrt(torch.clamp(beta_t, min=1e-12))
+                noise = torch.randn_like(x)
+                x = x + drift * dt_resolved + diffusion * noise_scale * noise
+            else:
+                x = x + drift * dt_resolved
+
             traj.append(x)
 
         self.score_network.train()
@@ -400,6 +339,41 @@ class DDPM:
             sqrt_one_minus_alpha_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t].unsqueeze(1)
             target_score = -noise / (sqrt_one_minus_alpha_cumprod_t + 1e-8)
             return nn.functional.mse_loss(predicted_score, target_score)
+
+    @torch.no_grad()
+    def predict(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        continuous: bool = True
+    ) -> torch.Tensor:
+        """
+        Estimate x_0 from a noisy sample x_t at time t.
+
+        Args:
+            x_t: Noisy sample
+            t: Time; continuous in [0, 1] if continuous=True, otherwise discrete step indices
+            continuous: Whether to use the continuous VP-SDE marginal or the discrete DDPM schedule
+        
+        Returns:
+            Estimated x_0 (same shape as x_t)
+        """
+        if continuous:
+            mean_coeff, std = self._marginal_mean_std(t)
+            mean_coeff = mean_coeff.unsqueeze(1)
+            std = std.unsqueeze(1)
+            score = self.score_network(x_t, t)
+        else:
+            if t.dtype != torch.long:
+                t = t.long()
+            mean_coeff = self.sqrt_alphas_cumprod[t].unsqueeze(1)
+            std = self.sqrt_one_minus_alphas_cumprod[t].unsqueeze(1)
+            score = self.score_network(x_t, t.float() / self.num_timesteps)
+
+        # Target score is -noise / std, so recover noise then denoise
+        noise_hat = -score * std
+        x0_hat = (x_t - std * noise_hat) / (mean_coeff + 1e-8)
+        return x0_hat
     
     def get_score_at_t(
         self,
