@@ -131,11 +131,30 @@ class DDPM:
             torch.tensor([1.0], device=device),
             self.alphas_cumprod[:-1]
         ])
+        self.beta_start = beta_start
+        self.beta_end = beta_end
+        self.beta_diff = beta_end - beta_start
         
         # Precompute constants for sampling
         self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
         self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
         self.posterior_variance = self.betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
+
+    def _beta(self, t: torch.Tensor) -> torch.Tensor:
+        """Continuous-time beta(t) for the VP-SDE."""
+        return self.beta_start + t * self.beta_diff
+
+    def _marginal_mean_std(self, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Marginal mean coefficient and std for VP-SDE at time t in [0, 1].
+
+        x(t) = mean_coeff * x0 + std * N(0, I)
+        """
+        # Integral_0^t beta(s) ds = beta_start * t + 0.5 * beta_diff * t^2
+        log_mean_coeff = -0.5 * (self.beta_start * t + 0.5 * self.beta_diff * t * t)
+        mean_coeff = torch.exp(log_mean_coeff)
+        std = torch.sqrt(torch.clamp(1.0 - mean_coeff ** 2, min=1e-12))
+        return mean_coeff, std
     
     def q_sample(
         self,
@@ -162,107 +181,129 @@ class DDPM:
         
         x_t = sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
         return x_t, noise
+
+    def sde_q_sample(
+        self,
+        x_start: torch.Tensor,
+        t: torch.Tensor,
+        noise: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Sample x_t from the continuous-time VP-SDE marginal.
+
+        Args:
+            x_start: Clean data
+            t: Continuous timesteps in [0, 1]
+            noise: Optional noise
+
+        Returns:
+            Tuple of (noisy samples, noise used)
+        """
+        if noise is None:
+            noise = torch.randn_like(x_start)
+        mean_coeff, std = self._marginal_mean_std(t)
+        mean_coeff = mean_coeff.unsqueeze(1)
+        std = std.unsqueeze(1)
+        x_t = mean_coeff * x_start + std * noise
+        return x_t, noise
     
-    def p_sample(
+    def _reverse_sde_step(
         self,
         x: torch.Tensor,
         t: torch.Tensor,
-        clip_denoised: bool = False
+        dt: float
     ) -> torch.Tensor:
-        """
-        Sample from p(x_{t-1} | x_t) using the learned score.
-        
-        Args:
-            x: Tensor of shape (batch_size, 2) with noisy data at timestep t
-            t: Tensor of shape (batch_size,) with timesteps
-            clip_denoised: Whether to clip denoised values (default: False for 2D landscapes)
-            
-        Returns:
-            Tensor of shape (batch_size, 2) with denoised samples
-        """
-        # Convert to long for indexing
-        t_index = t.long()
-        
-        # Normalize timestep to [0, 1] for the network
-        t_normalized = t.float() / self.num_timesteps
-        
-        # Predict score (which is -noise / sqrt(1 - alpha_bar_t))
-        predicted_score = self.score_network(x, t_normalized)
-        
-        # Compute predicted noise
-        sqrt_one_minus_alpha_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t_index].unsqueeze(1)
-        predicted_noise = -predicted_score * sqrt_one_minus_alpha_cumprod_t
-        
-        # Compute x_0 prediction
-        sqrt_alpha_cumprod_t = self.sqrt_alphas_cumprod[t_index].unsqueeze(1)
-        pred_x_start = (x - sqrt_one_minus_alpha_cumprod_t * predicted_noise) / sqrt_alpha_cumprod_t
-        
-        if clip_denoised:
-            pred_x_start = torch.clamp(pred_x_start, -1.0, 1.0)
-        
-        # At t=0, just return predicted x_0
-        nonzero_mask = (t_index != 0).float().unsqueeze(1)
-        if nonzero_mask.sum() == 0:
-            return pred_x_start
-        
-        # Compute mean of p(x_{t-1} | x_t, x_0)
-        posterior_mean_coef1 = (
-            torch.sqrt(self.alphas_cumprod_prev[t_index]) * self.betas[t_index]
-        ).unsqueeze(1) / (1.0 - self.alphas_cumprod[t_index].unsqueeze(1))
-        
-        posterior_mean_coef2 = (
-            torch.sqrt(self.alphas[t_index]) * (1.0 - self.alphas_cumprod_prev[t_index])
-        ).unsqueeze(1) / (1.0 - self.alphas_cumprod[t_index].unsqueeze(1))
-        
-        posterior_mean = posterior_mean_coef1 * pred_x_start + posterior_mean_coef2 * x
-        
-        # Sample from posterior
-        posterior_variance_t = self.posterior_variance[t_index].unsqueeze(1)
-        posterior_variance_t = torch.clamp(posterior_variance_t, min=1e-20)
-        
+        """One Euler-Maruyama step of the reverse-time VP-SDE."""
+        beta_t = self._beta(t).unsqueeze(1)
+        score = self.score_network(x, t)
+        drift = -0.5 * beta_t * x - beta_t * score
+        diffusion = torch.sqrt(torch.clamp(beta_t, min=1e-12))
         noise = torch.randn_like(x)
-        sample = posterior_mean + nonzero_mask * torch.sqrt(posterior_variance_t) * noise
-        
-        return sample
-    
-    def p_sample_loop(
+        return x + drift * dt + diffusion * math.sqrt(-dt) * noise
+
+    def _probability_flow_step(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        dt: float
+    ) -> torch.Tensor:
+        """One Euler step of the probability-flow ODE (deterministic sampler)."""
+        beta_t = self._beta(t).unsqueeze(1)
+        score = self.score_network(x, t)
+        drift = -0.5 * beta_t * x - 0.5 * beta_t * score
+        return x + drift * dt
+
+    def sde_sample(
         self,
         shape: Tuple[int, ...],
+        num_steps: Optional[int] = None,
         return_all_timesteps: bool = False
     ) -> torch.Tensor:
         """
-        Generate samples by running the reverse diffusion process.
-        
+        Sample using the reverse SDE (stochastic Euler-Maruyama).
+
         Args:
-            shape: Shape of samples to generate (batch_size, 2)
-            return_all_timesteps: Whether to return all intermediate timesteps
-            
-        Returns:
-            Generated samples, or list of all timesteps if return_all_timesteps=True
+            shape: Output shape (batch_size, 2)
+            num_steps: Discretization steps (defaults to num_timesteps)
+            return_all_timesteps: Whether to return the full trajectory
         """
         self.score_network.eval()
         batch_size = shape[0]
-        
-        # Start from pure noise
+        steps = num_steps or self.num_timesteps
+        dt = -1.0 / steps
+        times = torch.linspace(1.0, 0.0, steps + 1, device=self.device)
+
         x = torch.randn(shape, device=self.device)
-        
         if return_all_timesteps:
-            imgs = [x]
-        
-        # Reverse diffusion
-        for i in reversed(range(0, self.num_timesteps)):
-            t = torch.full((batch_size,), i, device=self.device, dtype=torch.long)
-            x = self.p_sample(x, t)
+            traj = [x]
+
+        for i in range(steps):
+            t = torch.full((batch_size,), times[i], device=self.device)
+            x = self._reverse_sde_step(x, t, dt)
             if return_all_timesteps:
-                imgs.append(x)
-        
+                traj.append(x)
+
         self.score_network.train()
-        return torch.stack(imgs) if return_all_timesteps else x
+        return torch.stack(traj) if return_all_timesteps else x
+
+    def ode_sample(
+        self,
+        shape: Tuple[int, ...],
+        num_steps: Optional[int] = None,
+        return_all_timesteps: bool = False
+    ) -> torch.Tensor:
+        """
+        Sample using the probability-flow ODE (deterministic; DDIM-like).
+
+        Args:
+            shape: Output shape (batch_size, 2)
+            num_steps: Discretization steps (defaults to num_timesteps)
+            return_all_timesteps: Whether to return the full trajectory
+        """
+        self.score_network.eval()
+        batch_size = shape[0]
+        steps = num_steps or self.num_timesteps
+        dt = -1.0 / steps
+        times = torch.linspace(1.0, 0.0, steps + 1, device=self.device)
+
+        x = torch.randn(shape, device=self.device)
+        if return_all_timesteps:
+            traj = [x]
+
+        for i in range(steps):
+            t = torch.full((batch_size,), times[i], device=self.device)
+            x = self._probability_flow_step(x, t, dt)
+            if return_all_timesteps:
+                traj.append(x)
+
+        self.score_network.train()
+        return torch.stack(traj) if return_all_timesteps else x
     
     def loss(
         self,
         x_start: torch.Tensor,
-        noise: Optional[torch.Tensor] = None
+        noise: Optional[torch.Tensor] = None,
+        continuous: bool = True
     ) -> torch.Tensor:
         """
         Compute the training loss.
@@ -270,32 +311,35 @@ class DDPM:
         Args:
             x_start: Tensor of shape (batch_size, 2) with clean data
             noise: Optional noise tensor
+            continuous: If True, use VP-SDE continuous-time loss; otherwise use discrete DDPM loss
             
         Returns:
             Scalar loss tensor
         """
         batch_size = x_start.shape[0]
-        
-        # Sample random timesteps
-        t = torch.randint(0, self.num_timesteps, (batch_size,), device=self.device).long()
-        
-        # Sample noisy data
-        x_t, noise = self.q_sample(x_start, t, noise)
-        
-        # Normalize timestep to [0, 1] for the network
-        t_normalized = t.float() / self.num_timesteps
-        
-        # Predict score
-        predicted_score = self.score_network(x_t, t_normalized)
-        
-        # Compute target score (which is -noise / sqrt(1 - alpha_bar_t))
-        sqrt_one_minus_alpha_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t].unsqueeze(1)
-        target_score = -noise / (sqrt_one_minus_alpha_cumprod_t + 1e-8)
-        
-        # MSE loss on scores
-        loss = nn.functional.mse_loss(predicted_score, target_score)
-        
-        return loss
+
+        if continuous:
+            if noise is None:
+                noise = torch.randn_like(x_start)
+            # Uniform continuous timesteps in [0, 1]
+            t = torch.rand(batch_size, device=self.device)
+            mean_coeff, std = self._marginal_mean_std(t)
+            mean_coeff = mean_coeff.unsqueeze(1)
+            std = std.unsqueeze(1)
+
+            x_t = mean_coeff * x_start + std * noise
+            predicted_score = self.score_network(x_t, t)
+            target_score = -noise / (std + 1e-8)
+            return nn.functional.mse_loss(predicted_score, target_score)
+        else:
+            # Original discrete DDPM loss
+            t = torch.randint(0, self.num_timesteps, (batch_size,), device=self.device).long()
+            x_t, noise = self.q_sample(x_start, t, noise)
+            t_normalized = t.float() / self.num_timesteps
+            predicted_score = self.score_network(x_t, t_normalized)
+            sqrt_one_minus_alpha_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t].unsqueeze(1)
+            target_score = -noise / (sqrt_one_minus_alpha_cumprod_t + 1e-8)
+            return nn.functional.mse_loss(predicted_score, target_score)
     
     def get_score_at_t(
         self,
@@ -319,4 +363,3 @@ class DDPM:
             score = self.score_network(x, t_normalized)
         self.score_network.train()
         return score
-

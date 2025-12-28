@@ -66,14 +66,14 @@ from models.ddpm import DDPM, MLPScoreNetwork
 # Create score network
 score_network = MLPScoreNetwork(input_dim=2, hidden_dims=[128, 256, 256, 128])
 
-# Create DDPM
+# Create DDPM (continuous-time VP-SDE)
 ddpm = DDPM(score_network, num_timesteps=1000, device="cpu")
 
 # Compute loss for training
 loss = ddpm.loss(x_start)
 
 # Generate samples
-samples = ddpm.p_sample_loop((batch_size, 2))
+samples = ddpm.sde_sample((batch_size, 2))
 ```
 
 ## Next Steps
@@ -83,4 +83,3 @@ samples = ddpm.p_sample_loop((batch_size, 2))
 - Create training scripts
 - Add visualization utilities
 - Experiment with different noise schedules and architectures
-
