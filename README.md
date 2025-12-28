@@ -72,8 +72,9 @@ ddpm = DDPM(score_network, num_timesteps=1000, device="cpu")
 # Compute loss for training
 loss = ddpm.loss(x_start)
 
-# Generate samples
-samples = ddpm.sde_sample((batch_size, 2))
+# Generate samples (trajectory returned; final sample at [-1])
+traj = ddpm.sde_sample((batch_size, 2))
+samples = traj[-1]
 ```
 
 ## Next Steps

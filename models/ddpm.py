@@ -233,71 +233,131 @@ class DDPM:
         drift = -0.5 * beta_t * x - 0.5 * beta_t * score
         return x + drift * dt
 
+    def _prepare_time_grid(
+        self,
+        t_span: Tuple[float, float],
+        num_steps: Optional[int],
+        num_total_steps: Optional[int]
+    ) -> Tuple[torch.Tensor, float, int]:
+        """
+        Build time grid and resolve dt/num_steps given a span.
+
+        Returns:
+            times (steps+1,), dt (float), steps (int)
+        """
+        t_start, t_end = t_span
+        span = t_end - t_start
+
+        if num_steps is None:
+            if num_total_steps is not None:
+                num_steps = max(1, int(math.ceil(abs(span) * num_total_steps)))
+            else:
+                num_steps = self.num_timesteps
+
+        dt = span / num_steps
+
+        times = t_start + torch.arange(num_steps + 1, device=self.device, dtype=torch.float32) * dt
+        if times.numel() > 0:
+            times[-1] = t_end  # ensure exact endpoint
+
+        return times, dt, num_steps
+
     def sde_sample(
         self,
-        shape: Tuple[int, ...],
+        shape: Optional[Tuple[int, ...]] = None,
+        x: Optional[torch.Tensor] = None,
+        t_span: Tuple[float, float] = (1.0, 0.0),
         num_steps: Optional[int] = None,
-        return_all_timesteps: bool = False
+        num_total_steps: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Sample using the reverse SDE (stochastic Euler-Maruyama).
 
         Args:
-            shape: Output shape (batch_size, 2)
-            num_steps: Discretization steps (defaults to num_timesteps)
-            return_all_timesteps: Whether to return the full trajectory
+            shape: Shape to initialize noise if x is None
+            x: Optional starting samples; if None, start from noise
+            t_span: (t_start, t_end) for denoising
+            num_steps: Explicit discretization steps
+            num_total_steps: Steps per unit time span (num_steps = |t_end-t_start| * num_total_steps)
+        
+        Returns:
+            Trajectory tensor of shape (steps+1, batch, dims)
         """
         self.score_network.eval()
+
+        if x is None:
+            if shape is None:
+                raise ValueError("Either x or shape must be provided for sampling.")
+            x = torch.randn(shape, device=self.device)
+        else:
+            shape = x.shape
+
         batch_size = shape[0]
-        steps = num_steps or self.num_timesteps
-        dt = -1.0 / steps
-        times = torch.linspace(1.0, 0.0, steps + 1, device=self.device)
+        times, dt_resolved, steps = self._prepare_time_grid(t_span, num_steps, num_total_steps)
 
-        x = torch.randn(shape, device=self.device)
-        if return_all_timesteps:
-            traj = [x]
+        traj = [x]
 
+        noise_scale = math.sqrt(abs(dt_resolved))
         for i in range(steps):
             t = torch.full((batch_size,), times[i], device=self.device)
-            x = self._reverse_sde_step(x, t, dt)
-            if return_all_timesteps:
-                traj.append(x)
+            # Reuse step but override dt for noise scale
+            beta_t = self._beta(t).unsqueeze(1)
+            score = self.score_network(x, t)
+            drift = -0.5 * beta_t * x - beta_t * score
+            diffusion = torch.sqrt(torch.clamp(beta_t, min=1e-12))
+            noise = torch.randn_like(x)
+            x = x + drift * dt_resolved + diffusion * noise_scale * noise
+
+            traj.append(x)
 
         self.score_network.train()
-        return torch.stack(traj) if return_all_timesteps else x
+        return torch.stack(traj)
 
     def ode_sample(
         self,
-        shape: Tuple[int, ...],
+        shape: Optional[Tuple[int, ...]] = None,
+        x: Optional[torch.Tensor] = None,
+        t_span: Tuple[float, float] = (1.0, 0.0),
         num_steps: Optional[int] = None,
-        return_all_timesteps: bool = False
+        num_total_steps: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Sample using the probability-flow ODE (deterministic; DDIM-like).
 
         Args:
-            shape: Output shape (batch_size, 2)
-            num_steps: Discretization steps (defaults to num_timesteps)
-            return_all_timesteps: Whether to return the full trajectory
+            shape: Shape to initialize noise if x is None
+            x: Optional starting samples; if None, start from noise
+            t_span: (t_start, t_end) for denoising
+            num_steps: Explicit discretization steps
+            num_total_steps: Steps per unit time span (num_steps = |t_end-t_start| * num_total_steps)
+        
+        Returns:
+            Trajectory tensor of shape (steps+1, batch, dims)
         """
         self.score_network.eval()
-        batch_size = shape[0]
-        steps = num_steps or self.num_timesteps
-        dt = -1.0 / steps
-        times = torch.linspace(1.0, 0.0, steps + 1, device=self.device)
 
-        x = torch.randn(shape, device=self.device)
-        if return_all_timesteps:
-            traj = [x]
+        if x is None:
+            if shape is None:
+                raise ValueError("Either x or shape must be provided for sampling.")
+            x = torch.randn(shape, device=self.device)
+        else:
+            shape = x.shape
+
+        batch_size = shape[0]
+        times, dt_resolved, steps = self._prepare_time_grid(t_span, num_steps, num_total_steps)
+
+        traj = [x]
 
         for i in range(steps):
             t = torch.full((batch_size,), times[i], device=self.device)
-            x = self._probability_flow_step(x, t, dt)
-            if return_all_timesteps:
-                traj.append(x)
+            beta_t = self._beta(t).unsqueeze(1)
+            score = self.score_network(x, t)
+            drift = -0.5 * beta_t * x - 0.5 * beta_t * score
+            x = x + drift * dt_resolved
+            traj.append(x)
 
         self.score_network.train()
-        return torch.stack(traj) if return_all_timesteps else x
+        return torch.stack(traj)
     
     def loss(
         self,
