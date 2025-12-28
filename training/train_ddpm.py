@@ -41,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-timesteps", type=int, default=1000, help="Diffusion steps")
     parser.add_argument("--beta-start", type=float, default=1e-4, help="Noise schedule start")
     parser.add_argument("--beta-end", type=float, default=2e-2, help="Noise schedule end")
+    parser.add_argument("--beta-schedule", type=str, default="linear", choices=["linear", "cosine"], help="Noise schedule type")
 
     # Optim
     parser.add_argument("--epochs", type=int, default=200, help="Training epochs")
@@ -169,10 +170,23 @@ def main() -> None:
         num_timesteps=args.num_timesteps,
         beta_start=args.beta_start,
         beta_end=args.beta_end,
+        beta_schedule=args.beta_schedule,
         device=str(device),
     )
 
     optimizer = torch.optim.Adam(ddpm.score_network.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    # Log uninitialized (epoch 0) losses
+    init_train_loss = evaluate(ddpm, train_loader, device, args)
+    init_val_loss = evaluate(ddpm, val_loader, device, args)
+    init_metrics = {
+        "epoch": 0,
+        "train_loss": init_train_loss,
+        "val_loss": init_val_loss,
+        "lr": optimizer.param_groups[0]["lr"],
+    }
+    log_metrics(run_dir, init_metrics)
+    print(f"[Epoch 0000] train={init_train_loss:.4f} val={init_val_loss:.4f}")
 
     best_val = float("inf")
     for epoch in range(1, args.epochs + 1):

@@ -107,6 +107,7 @@ class DDPM:
         num_timesteps: int = 1000,
         beta_start: float = 0.0001,
         beta_end: float = 0.02,
+        beta_schedule: str = "linear",
         device: str = "cpu"
     ):
         """
@@ -117,14 +118,16 @@ class DDPM:
             num_timesteps: Number of diffusion timesteps
             beta_start: Starting noise schedule value
             beta_end: Ending noise schedule value
+            beta_schedule: Noise schedule type ("linear" or "cosine")
             device: Device to run on
         """
         self.score_network = score_network.to(device)
         self.num_timesteps = num_timesteps
         self.device = device
+        self.beta_schedule = beta_schedule.lower()
         
-        # Linear noise schedule
-        self.betas = torch.linspace(beta_start, beta_end, num_timesteps, device=device)
+        # Noise schedule (supports linear or cosine)
+        self.betas = self._build_betas(beta_start, beta_end, num_timesteps, device)
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
         self.alphas_cumprod_prev = torch.cat([
@@ -133,16 +136,48 @@ class DDPM:
         ])
         self.beta_start = beta_start
         self.beta_end = beta_end
-        self.beta_diff = beta_end - beta_start
         
         # Precompute constants for sampling
         self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
         self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
         self.posterior_variance = self.betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
 
+    def _build_betas(
+        self,
+        beta_start: float,
+        beta_end: float,
+        num_steps: int,
+        device: str
+    ) -> torch.Tensor:
+        """
+        Build a beta schedule.
+
+        Cosine schedule follows Nichol & Dhariwal (2021) using alpha_bar(t)=cos^2.
+        """
+        if self.beta_schedule == "cosine":
+            s = 0.008
+            steps = num_steps + 1
+            t = torch.linspace(0, num_steps, steps, device=device) / num_steps
+            alphas_cumprod = torch.cos((t + s) / (1 + s) * math.pi * 0.5) ** 2
+            alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+            betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+            return torch.clamp(betas, min=1e-8, max=0.999)
+        else:
+            return torch.linspace(beta_start, beta_end, num_steps, device=device)
+
+    def _interp(self, arr: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """
+        Linear interpolate over a 1D array with t in [0, 1].
+        """
+        t_idx = t * (arr.numel() - 1)
+        low = torch.clamp(t_idx.floor().long(), 0, arr.numel() - 1)
+        high = torch.clamp(low + 1, 0, arr.numel() - 1)
+        w = t_idx - low.float()
+        return arr[low] * (1 - w) + arr[high] * w
+
     def _beta(self, t: torch.Tensor) -> torch.Tensor:
-        """Continuous-time beta(t) for the VP-SDE."""
-        return self.beta_start + t * self.beta_diff
+        """beta(t) via interpolation over the discrete schedule."""
+        return self._interp(self.betas, t)
 
     def _marginal_mean_std(self, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -150,10 +185,10 @@ class DDPM:
 
         x(t) = mean_coeff * x0 + std * N(0, I)
         """
-        # Integral_0^t beta(s) ds = beta_start * t + 0.5 * beta_diff * t^2
-        log_mean_coeff = -0.5 * (self.beta_start * t + 0.5 * self.beta_diff * t * t)
-        mean_coeff = torch.exp(log_mean_coeff)
-        std = torch.sqrt(torch.clamp(1.0 - mean_coeff ** 2, min=1e-12))
+        log_alpha_bar = torch.log(torch.clamp(self.alphas_cumprod, min=1e-12))
+        log_alpha_t = self._interp(log_alpha_bar, t)
+        mean_coeff = torch.exp(0.5 * log_alpha_t)
+        std = torch.sqrt(torch.clamp(1.0 - torch.exp(log_alpha_t), min=1e-12))
         return mean_coeff, std
     
     def q_sample(
