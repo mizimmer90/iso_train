@@ -14,27 +14,19 @@ import math
 class SinusoidalPositionalEmbeddings(nn.Module):
     """Sinusoidal positional embeddings for time steps."""
     
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, max_freq: float = 10000):
         super().__init__()
         self.dim = dim
-    
+        self.max_freq = max_freq
+
     def forward(self, time: torch.Tensor) -> torch.Tensor:
-        """
-        Create sinusoidal embeddings for time steps.
-        
-        Args:
-            time: Tensor of shape (batch_size,) with time steps
-            
-        Returns:
-            Tensor of shape (batch_size, dim) with embeddings
-        """
-        device = time.device
-        half_dim = self.dim // 2
-        embeddings = math.log(10000) / (half_dim - 1)
-        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
-        embeddings = time[:, None] * embeddings[None, :]
-        embeddings = torch.cat([embeddings.sin(), embeddings.cos()], dim=-1)
-        return embeddings
+        half = self.dim // 2
+        freqs = torch.exp(
+            torch.linspace(0, math.log(self.max_freq), half)
+        )
+        args = time[:, None] * freqs[None, :]
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+        return emb
 
 
 class MLPScoreNetwork(nn.Module):
@@ -43,10 +35,11 @@ class MLPScoreNetwork(nn.Module):
     def __init__(
         self,
         input_dim: int = 2,
-        hidden_dims: list = [128, 256, 256, 128],
-        time_embed_dim: int = 128,
+        hidden_dims: list = [128, 128, 128],
+        time_embed_dim: int = 64,
+        time_embed_hidden: int = 128,
         activation: nn.Module = nn.SiLU(),
-        dropout: float = 0.1
+        dropout: float = 0.0
     ):
         """
         Initialize the score network.
@@ -54,27 +47,38 @@ class MLPScoreNetwork(nn.Module):
         Args:
             input_dim: Dimension of input data (2 for 2D)
             hidden_dims: List of hidden layer dimensions
-            time_embed_dim: Dimension of time embeddings
+            time_embed_dim: Dimension of sinusoidal time embeddings
+            time_embed_hidden: Hidden dimension for time embedding MLP
             activation: Activation function
             dropout: Dropout rate
         """
         super().__init__()
         
         self.time_embed_dim = time_embed_dim
-        self.time_embed = SinusoidalPositionalEmbeddings(time_embed_dim)
+        self.time_embed_hidden = time_embed_hidden
         
-        # Build MLP layers
-        dims = [input_dim + time_embed_dim] + hidden_dims + [input_dim]
-        layers = []
+        # Time embedding: sinusoidal -> MLP transformation
+        self.time_embed = nn.Sequential(
+            SinusoidalPositionalEmbeddings(time_embed_dim),
+            nn.Linear(time_embed_dim, time_embed_hidden),
+            activation,
+            nn.Linear(time_embed_hidden, time_embed_hidden),
+        )
+        
+        # Build MLP layers (no time embedding concatenation)
+        dims = [input_dim] + hidden_dims + [input_dim]
+        self.layers = nn.ModuleList()
         
         for i in range(len(dims) - 1):
-            layers.append(nn.Linear(dims[i], dims[i + 1]))
-            if i < len(dims) - 2:
-                layers.append(activation)
-                if dropout > 0:
-                    layers.append(nn.Dropout(dropout))
+            self.layers.append(nn.Linear(dims[i], dims[i + 1]))
         
-        self.network = nn.Sequential(*layers)
+        # Separate learned projections of time embeddings for each hidden layer
+        self.time_projections = nn.ModuleList()
+        for i in range(len(hidden_dims)):
+            self.time_projections.append(nn.Linear(time_embed_hidden, dims[i + 1]))
+        
+        self.activation = activation
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else None
     
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """
@@ -87,15 +91,27 @@ class MLPScoreNetwork(nn.Module):
         Returns:
             Tensor of shape (batch_size, input_dim) with predicted scores
         """
-        # Get time embeddings
-        t_embed = self.time_embed(t * 1000)  # Scale time for better embeddings
+        # Get transformed time embeddings (constant for this forward pass)
+        h_t = self.time_embed(t)
         
-        # Concatenate input and time embeddings
-        x_t = torch.cat([x, t_embed], dim=-1)
+        # Forward through network with time embeddings added at each hidden layer
+        h = x
+        num_hidden = len(self.time_projections)
         
-        # Forward through network
-        score = self.network(x_t)
-        return score
+        for i in range(len(self.layers)):
+            h = self.layers[i](h)
+            
+            # Add time embedding projection for hidden layers
+            if i < num_hidden:
+                h = h + self.time_projections[i](h_t)
+            
+            # Apply activation and dropout (except for output layer)
+            if i < len(self.layers) - 1:
+                h = self.activation(h)
+                if self.dropout is not None:
+                    h = self.dropout(h)
+        
+        return h
 
 
 class DDPM:
@@ -104,9 +120,8 @@ class DDPM:
     def __init__(
         self,
         score_network: nn.Module,
-        num_timesteps: int = 1000,
-        beta_start: float = 0.0001,
-        beta_end: float = 0.02,
+        beta_min: float = 0.2,
+        beta_max: float = 20,
         beta_schedule: str = "linear",
         device: str = "cpu"
     ):
@@ -115,320 +130,84 @@ class DDPM:
         
         Args:
             score_network: Neural network for predicting scores
-            num_timesteps: Number of diffusion timesteps
-            beta_start: Starting noise schedule value
-            beta_end: Ending noise schedule value
+            beta_min: Starting noise schedule value
+            beta_max: Ending noise schedule value
             beta_schedule: Noise schedule type ("linear" or "cosine")
             device: Device to run on
         """
         self.score_network = score_network.to(device)
-        self.num_timesteps = num_timesteps
         self.device = device
         self.beta_schedule = beta_schedule.lower()
         
-        # Noise schedule (supports linear or cosine)
-        self.betas = self._build_betas(beta_start, beta_end, num_timesteps, device)
-        self.alphas = 1.0 - self.betas
-        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-        self.alphas_cumprod_prev = torch.cat([
-            torch.tensor([1.0], device=device),
-            self.alphas_cumprod[:-1]
-        ])
-        self.beta_start = beta_start
-        self.beta_end = beta_end
+        self.beta_min = beta_min
+        self.beta_max = beta_max
         
-        # Precompute constants for sampling
-        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
-        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
-        self.posterior_variance = self.betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
-
-    def _build_betas(
-        self,
-        beta_start: float,
-        beta_end: float,
-        num_steps: int,
-        device: str
-    ) -> torch.Tensor:
-        """
-        Build a beta schedule.
-
-        Cosine schedule follows Nichol & Dhariwal (2021) using alpha_bar(t)=cos^2.
-        """
-        if self.beta_schedule == "cosine":
-            s = 0.008
-            steps = num_steps + 1
-            t = torch.linspace(0, num_steps, steps, device=device) / num_steps
-            alphas_cumprod = torch.cos((t + s) / (1 + s) * math.pi * 0.5) ** 2
-            alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-            betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-            return torch.clamp(betas, min=1e-8, max=0.999)
-        else:
-            return torch.linspace(beta_start, beta_end, num_steps, device=device)
-
-    def _interp(self, arr: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """
-        Linear interpolate over a 1D array with t in [0, 1].
-        """
-        t_idx = t * (arr.numel() - 1)
-        low = torch.clamp(t_idx.floor().long(), 0, arr.numel() - 1)
-        high = torch.clamp(low + 1, 0, arr.numel() - 1)
-        w = t_idx - low.float()
-        return arr[low] * (1 - w) + arr[high] * w
-
-    def _beta(self, t: torch.Tensor) -> torch.Tensor:
-        """beta(t) via interpolation over the discrete schedule."""
-        return self._interp(self.betas, t)
-
-    def _marginal_mean_std(self, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Marginal mean coefficient and std for VP-SDE at time t in [0, 1].
-
-        x(t) = mean_coeff * x0 + std * N(0, I)
-        """
-        log_alpha_bar = torch.log(torch.clamp(self.alphas_cumprod, min=1e-12))
-        log_alpha_t = self._interp(log_alpha_bar, t)
-        mean_coeff = torch.exp(0.5 * log_alpha_t)
-        std = torch.sqrt(torch.clamp(1.0 - torch.exp(log_alpha_t), min=1e-12))
-        return mean_coeff, std
+    def _beta(self, t):
+        return self.beta_min * t + 0.5 *(self.beta_max - self.beta_min) * (t * t)
     
-    def q_sample(
-        self,
-        x_start: torch.Tensor,
-        t: torch.Tensor,
-        noise: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Sample from q(x_t | x_0).
-        
-        Args:
-            x_start: Tensor of shape (batch_size, 2) with clean data
-            t: Tensor of shape (batch_size,) with timesteps
-            noise: Optional noise tensor, if None will be sampled
-            
-        Returns:
-            Tuple of (noisy samples, noise used)
-        """
+    def _alpha(self, t, beta=None):
+        if beta is None:
+            beta = self._beta(t)
+        return torch.exp(-0.5*beta)
+
+    def _sigma(self, t, alpha=None):
+        if alpha is None:
+            alpha = self._alpha(t)
+        return torch.sqrt(1 - (alpha * alpha))
+    
+    def q_forward(self, x0, t, noise=None):
         if noise is None:
-            noise = torch.randn_like(x_start)
+            noise = torch.randn_like(x0)
         
-        sqrt_alphas_cumprod_t = self.sqrt_alphas_cumprod[t].unsqueeze(1)
-        sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t].unsqueeze(1)
-        
-        x_t = sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
-        return x_t, noise
-
-    def sde_q_sample(
-        self,
-        x_start: torch.Tensor,
-        t: torch.Tensor,
-        noise: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Sample x_t from the continuous-time VP-SDE marginal.
-
-        Args:
-            x_start: Clean data
-            t: Continuous timesteps in [0, 1]
-            noise: Optional noise
-
-        Returns:
-            Tuple of (noisy samples, noise used)
-        """
-        if noise is None:
-            noise = torch.randn_like(x_start)
-        mean_coeff, std = self._marginal_mean_std(t)
-        mean_coeff = mean_coeff.unsqueeze(1)
-        std = std.unsqueeze(1)
-        x_t = mean_coeff * x_start + std * noise
-        return x_t, noise
+        alpha = self._alpha(t)
+        sigma = self._sigma(t, alpha=alpha)
+        xt = alpha[:,None]*x0 + sigma[:,None]*noise
+        return xt, noise
     
-    def _prepare_time_grid(
-        self,
-        t_span: Tuple[float, float],
-        num_steps: Optional[int],
-        num_total_steps: Optional[int]
-    ) -> Tuple[torch.Tensor, float, int]:
-        """
-        Build time grid and resolve dt/num_steps given a span.
-
-        Returns:
-            times (steps+1,), dt (float), steps (int)
-        """
-        t_start, t_end = t_span
-        span = t_end - t_start
-
-        if num_steps is None:
-            if num_total_steps is not None:
-                num_steps = max(1, int(math.ceil(abs(span) * num_total_steps)))
-            else:
-                num_steps = self.num_timesteps
-
-        dt = span / num_steps
-
-        times = t_start + torch.arange(num_steps + 1, device=self.device, dtype=torch.float32) * dt
-        if times.numel() > 0:
-            times[-1] = t_end  # ensure exact endpoint
-
-        return times, dt, num_steps
-
-    def sample(
-        self,
-        shape: Optional[Tuple[int, ...]] = None,
-        x: Optional[torch.Tensor] = None,
-        t_span: Tuple[float, float] = (1.0, 0.0),
-        num_steps: Optional[int] = None,
-        num_total_steps: Optional[int] = None,
-        mode: str = "sde",
-    ) -> torch.Tensor:
-        """
-        Sample using the reverse process with either the SDE (stochastic) or ODE (deterministic).
-
-        Args:
-            shape: Shape to initialize noise if x is None
-            x: Optional starting samples; if None, start from noise
-            t_span: (t_start, t_end) for denoising
-            num_steps: Explicit discretization steps
-            num_total_steps: Steps per unit time span (num_steps = |t_end-t_start| * num_total_steps)
-            mode: "sde" for Euler-Maruyama sampling, "ode" for probability-flow ODE
-        
-        Returns:
-            Trajectory tensor of shape (steps+1, batch, dims)
-        """
-        mode = mode.lower()
-        if mode not in {"sde", "ode"}:
-            raise ValueError(f"Unsupported sampling mode '{mode}'. Use 'sde' or 'ode'.")
-
-        self.score_network.eval()
-
-        if x is None:
-            if shape is None:
-                raise ValueError("Either x or shape must be provided for sampling.")
-            x = torch.randn(shape, device=self.device)
-        else:
-            shape = x.shape
-
-        batch_size = shape[0]
-        times, dt_resolved, steps = self._prepare_time_grid(t_span, num_steps, num_total_steps)
-        traj = [x]
-
-        # Shared drift, with mode-specific scaling on the score term
-        score_scale = 1.0 if mode == "sde" else 0.5
-        noise_scale = math.sqrt(abs(dt_resolved)) if mode == "sde" else None
-
-        for i in range(steps):
-            t = torch.full((batch_size,), times[i], device=self.device)
-            beta_t = self._beta(t).unsqueeze(1)
-            score = self.score_network(x, t)
-            drift = -0.5 * beta_t * x - score_scale * beta_t * score
-
-            if mode == "sde":
-                diffusion = torch.sqrt(torch.clamp(beta_t, min=1e-12))
-                noise = torch.randn_like(x)
-                x = x + drift * dt_resolved + diffusion * noise_scale * noise
-            else:
-                x = x + drift * dt_resolved
-
-            traj.append(x)
-
-        self.score_network.train()
-        return torch.stack(traj)
-    
-    def loss(
-        self,
-        x_start: torch.Tensor,
-        noise: Optional[torch.Tensor] = None,
-        continuous: bool = True
-    ) -> torch.Tensor:
+    def loss(self, xt, noise):
         """
         Compute the training loss.
         
-        Args:
-            x_start: Tensor of shape (batch_size, 2) with clean data
-            noise: Optional noise tensor
-            continuous: If True, use VP-SDE continuous-time loss; otherwise use discrete DDPM loss
-            
-        Returns:
-            Scalar loss tensor
+        loss = ||sigma(t)*score(xt,t) + noise||^2
         """
-        batch_size = x_start.shape[0]
 
-        if continuous:
-            if noise is None:
-                noise = torch.randn_like(x_start)
-            # Uniform continuous timesteps in [0, 1]
-            t = torch.rand(batch_size, device=self.device)
-            mean_coeff, std = self._marginal_mean_std(t)
-            mean_coeff = mean_coeff.unsqueeze(1)
-            std = std.unsqueeze(1)
-
-            x_t = mean_coeff * x_start + std * noise
-            predicted_score = self.score_network(x_t, t)
-            target_score = -noise / (std + 1e-8)
-            return nn.functional.mse_loss(predicted_score, target_score)
-        else:
-            # Original discrete DDPM loss
-            t = torch.randint(0, self.num_timesteps, (batch_size,), device=self.device).long()
-            x_t, noise = self.q_sample(x_start, t, noise)
-            t_normalized = t.float() / self.num_timesteps
-            predicted_score = self.score_network(x_t, t_normalized)
-            sqrt_one_minus_alpha_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t].unsqueeze(1)
-            target_score = -noise / (sqrt_one_minus_alpha_cumprod_t + 1e-8)
-            return nn.functional.mse_loss(predicted_score, target_score)
-
-    @torch.no_grad()
-    def predict(
-        self,
-        x_t: torch.Tensor,
-        t: torch.Tensor,
-        continuous: bool = True
-    ) -> torch.Tensor:
-        """
-        Estimate x_0 from a noisy sample x_t at time t.
-
-        Args:
-            x_t: Noisy sample
-            t: Time; continuous in [0, 1] if continuous=True, otherwise discrete step indices
-            continuous: Whether to use the continuous VP-SDE marginal or the discrete DDPM schedule
-        
-        Returns:
-            Estimated x_0 (same shape as x_t)
-        """
-        if continuous:
-            mean_coeff, std = self._marginal_mean_std(t)
-            mean_coeff = mean_coeff.unsqueeze(1)
-            std = std.unsqueeze(1)
-            score = self.score_network(x_t, t)
-        else:
-            if t.dtype != torch.long:
-                t = t.long()
-            mean_coeff = self.sqrt_alphas_cumprod[t].unsqueeze(1)
-            std = self.sqrt_one_minus_alphas_cumprod[t].unsqueeze(1)
-            score = self.score_network(x_t, t.float() / self.num_timesteps)
-
-        # Target score is -noise / std, so recover noise then denoise
-        noise_hat = -score * std
-        x0_hat = (x_t - std * noise_hat) / (mean_coeff + 1e-8)
-        return x0_hat
+        sigmas = self._sigma(t)
+        pred_score = self.score_network(xt, t)
+        return nn.functional.mse_loss(sigmas[:,None]*pred_score, -noise)
     
-    def get_score_at_t(
-        self,
-        x: torch.Tensor,
-        t: int
-    ) -> torch.Tensor:
-        """
-        Get the score function at a specific noise level t.
-        
-        Args:
-            x: Tensor of shape (batch_size, 2) with data
-            t: Timestep (integer from 0 to num_timesteps-1)
-            
-        Returns:
-            Tensor of shape (batch_size, 2) with scores
-        """
+    def _sde_step(self, xt, t, dt):
+        beta_t = self._beta(t)
+        score = self.score_network(xt, t)
+        noise = torch.randn_like(xt)
+        xt = xt + 0.5*((-beta_t[:,None]*xt) - (beta_t[:,None]*score))*dt + torch.sqrt(beta_t[:,None]*dt)*noise
+        return xt
+    
+    def _ode_step(self, xt, t, dt):
+        beta_t = self._beta(t)
+        score = self.score_network(xt, t)
+        xt = xt + 0.5*((-beta_t[:,None]*xt) - (beta_t[:,None]*score))*dt
+        return xt
+    
+    def sample(self, xt, tspan=(1,0), n_total_steps=200, n_steps=None, mode='sde'):
         self.score_network.eval()
-        with torch.no_grad():
-            t_tensor = torch.full((x.shape[0],), t, device=self.device, dtype=torch.long)
-            t_normalized = t_tensor.float() / self.num_timesteps
-            score = self.score_network(x, t_normalized)
-        self.score_network.train()
-        return score
+        
+        if n_steps is None:
+            n_steps = (tspan[0] - tspan[1])*n_total_steps
+
+        dt = (tspan[0] - tspan[1]) / n_steps
+
+
+        times = np.linspace(tspan[0], tspan[1], n_steps)
+        traj = [xt]
+
+        for t_tmp in times:
+            t = torch.tensor([t_tmp]*b).type(xt.dtype)
+            if mode == 'sde':
+                xt = self._sde_step(xt, t, dt)
+            elif mode == 'ode':
+                xt = self._ode_step(xt, t, dt)
+            else:
+                raise Exeption("unrecognized mode")
+            traj.append(xt)
+        traj = torch.stack(traj)
+        return traj
