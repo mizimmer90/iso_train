@@ -184,13 +184,15 @@ class DDPM:
         beta_t = self._beta(t)
         score = self.score_network(xt, t)
         noise = torch.randn_like(xt)
-        xt = xt + 0.5*((-beta_t[:,None]*xt) - (beta_t[:,None]*score))*dt + torch.sqrt(beta_t[:,None]*dt)*noise
+        drift = (-0.5*beta_t[:,None]*xt) - (beta_t[:,None]*score)
+        xt = xt - drift*dt + torch.sqrt(beta_t[:,None]*dt)*noise
         return xt
     
     def _ode_step(self, xt, t, dt):
         beta_t = self._beta(t)
         score = self.score_network(xt, t)
-        xt = xt + 0.5*((-beta_t[:,None]*xt) - (beta_t[:,None]*score))*dt
+        drift = 0.5*(beta_t[:, None]*xt + beta_t[:, None]*score)
+        xt = xt + drift*dt
         return xt
     
     def sample(self, xt, tspan=(1,0), n_total_steps=200, n_steps=None, mode='sde'):
@@ -217,3 +219,10 @@ class DDPM:
             traj.append(xt)
         traj = torch.stack(traj)
         return traj
+
+    def predict(self, xt, t):
+        alpha = self._alpha(t)
+        sigma = self._sigma(t, alpha=alpha)
+        score = self.score_network(xt, t)
+        x0 = (xt + (sigma[:,None]**2)*score)/alpha[:,None]
+        return x0
