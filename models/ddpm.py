@@ -142,13 +142,16 @@ class DDPM:
         self.beta_min = beta_min
         self.beta_max = beta_max
         
-    def _beta(self, t):
+    def _Beta(self, t):
         return self.beta_min * t + 0.5 *(self.beta_max - self.beta_min) * (t * t)
     
-    def _alpha(self, t, beta=None):
-        if beta is None:
-            beta = self._beta(t)
-        return torch.exp(-0.5*beta)
+    def _beta(self,t):
+        return self.beta_min + (self.beta_max - self.beta_min) * t
+
+    def _alpha(self, t, Beta=None):
+        if Beta is None:
+            Beta = self._Beta(t)
+        return torch.exp(-0.5*Beta)
 
     def _sigma(self, t, alpha=None):
         if alpha is None:
@@ -185,44 +188,43 @@ class DDPM:
         score = self.score_network(xt, t)
         noise = torch.randn_like(xt)
         drift = (-0.5*beta_t[:,None]*xt) - (beta_t[:,None]*score)
-        xt = xt - drift*dt + torch.sqrt(beta_t[:,None]*dt)*noise
+        xt = xt + drift*dt + torch.sqrt(beta_t[:,None]*np.abs(dt))*noise
         return xt
     
     def _ode_step(self, xt, t, dt):
         beta_t = self._beta(t)
         score = self.score_network(xt, t)
-        drift = 0.5*(beta_t[:, None]*xt + beta_t[:, None]*score)
+        drift = -0.5*(beta_t[:, None]*xt + beta_t[:, None]*score)
         xt = xt + drift*dt
         return xt
     
-    def sample(self, xt, tspan=(1,0), n_total_steps=200, n_steps=None, mode='sde'):
+    def sample(self, xt, tspan=(1, 0), n_steps=200, mode='sde'):
         self.score_network.eval()
-        
         b = xt.shape[0]
-        if n_steps is None:
-            n_steps = (tspan[0] - tspan[1])*n_total_steps
 
-        dt = (tspan[0] - tspan[1]) / n_steps
-
-
-        times = np.linspace(tspan[0], tspan[1], n_steps)
+        times = np.linspace(tspan[0], tspan[1], n_steps + 1)  # include endpoints
         traj = [xt]
 
-        for t_tmp in times:
-            t = torch.tensor([t_tmp]*b, dtype=xt.dtype, device=xt.device)
+        for i in range(n_steps):
+            t_tmp = times[i]
+            dt = times[i+1] - times[i]   # this will be NEGATIVE for 1 -> 0
+            t = torch.full((b,), float(t_tmp), dtype=xt.dtype, device=xt.device)
+
             if mode == 'sde':
                 xt = self._sde_step(xt, t, dt)
             elif mode == 'ode':
                 xt = self._ode_step(xt, t, dt)
             else:
-                raise Exception("unrecognized mode")
+                raise ValueError("unrecognized mode")
+
             traj.append(xt)
-        traj = torch.stack(traj)
-        return traj
+
+        return torch.stack(traj)
+
 
     def predict(self, xt, t):
         alpha = self._alpha(t)
         sigma = self._sigma(t, alpha=alpha)
         score = self.score_network(xt, t)
-        x0 = (xt + (sigma[:,None]**2)*score)/alpha[:,None]
+        x0 = (xt + (sigma[:,None]*sigma[:,None ])*score)/alpha[:,None]
         return x0
