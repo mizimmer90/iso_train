@@ -164,13 +164,18 @@ class DDPM:
         xt = alpha[:,None]*x0 + sigma[:,None]*noise
         return xt, noise
     
-    def loss(self, xt, noise):
+    def loss(self, xt, noise, t):
         """
         Compute the training loss.
         
-        loss = ||sigma(t)*score(xt,t) + noise||^2
+        Args:
+            xt: Noisy data at time t, shape (batch_size, input_dim)
+            noise: The noise that was added, shape (batch_size, input_dim)
+            t: Time steps, shape (batch_size,)
+        
+        Returns:
+            loss = ||sigma(t)*score(xt,t) + noise||^2
         """
-
         sigmas = self._sigma(t)
         pred_score = self.score_network(xt, t)
         return nn.functional.mse_loss(sigmas[:,None]*pred_score, -noise)
@@ -191,6 +196,7 @@ class DDPM:
     def sample(self, xt, tspan=(1,0), n_total_steps=200, n_steps=None, mode='sde'):
         self.score_network.eval()
         
+        b = xt.shape[0]
         if n_steps is None:
             n_steps = (tspan[0] - tspan[1])*n_total_steps
 
@@ -201,13 +207,13 @@ class DDPM:
         traj = [xt]
 
         for t_tmp in times:
-            t = torch.tensor([t_tmp]*b).type(xt.dtype)
+            t = torch.tensor([t_tmp]*b, dtype=xt.dtype, device=xt.device)
             if mode == 'sde':
                 xt = self._sde_step(xt, t, dt)
             elif mode == 'ode':
                 xt = self._ode_step(xt, t, dt)
             else:
-                raise Exeption("unrecognized mode")
+                raise Exception("unrecognized mode")
             traj.append(xt)
         traj = torch.stack(traj)
         return traj
