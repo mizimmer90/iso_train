@@ -2,6 +2,13 @@
 
 This project implements a Denoising Diffusion Probabilistic Model (DDPM) trained on a 2D toy landscape, with iso-time simulations used for contrastive divergence during training.
 
+
+https://github.com/user-attachments/assets/b61ac961-6371-44b4-b948-12cb3628b46f
+
+
+https://github.com/user-attachments/assets/5810e9a9-7395-434d-b766-4a03be1bd4e0
+
+
 ## Overview
 
 The project explores using iso-time simulations as a contrastive divergence signal during DDPM training. Iso-time simulations take the score of a DDPM at a particular noise level and treat it like an energy landscape, performing Langevin sampling at that specified noise level.
