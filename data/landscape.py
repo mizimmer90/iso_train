@@ -279,37 +279,3 @@ def create_four_mode_landscape(
 
 # For backwards compatibility - allows FourModeLandscape(scale=2.0, std=0.5) to work
 FourModeLandscape = create_four_mode_landscape
-
-
-if __name__ == "__main__":
-    # Test the general landscape generator
-    print("Testing general GaussianLandscape...")
-    centers = torch.tensor([[1.0, 1.0], [-1.0, 1.0], [-1.0, -1.0], [1.0, -1.0]])
-    stds = torch.tensor([0.5, 0.3, 0.7, 0.4])
-    landscape = GaussianLandscape(centers=centers, stds=stds)
-    print(f"✓ Created landscape with {landscape.n_modes} modes")
-    
-    # Test the four-mode convenience function
-    print("\nTesting create_four_mode_landscape...")
-    landscape_four = create_four_mode_landscape(scale=2.0, std=0.5)
-    print(f"✓ Created 4-mode landscape with scale=2.0, std=0.5")
-    
-    # Test with different stds per mode
-    landscape_four_var = create_four_mode_landscape(scale=2.0, std=(0.3, 0.5, 0.7, 0.4))
-    print(f"✓ Created 4-mode landscape with variable stds")
-    
-    # Visualize
-    print("\nGenerating landscape visualizations...")
-    landscape_four.visualize(save_path="landscape_visualization.png")
-    
-    # Test sampling
-    samples = landscape_four.sample(1000)
-    print(f"\n✓ Sampled {len(samples)} points")
-    print(f"  Sample mean: {samples.mean(dim=0)}")
-    print(f"  Sample std: {samples.std(dim=0)}")
-    
-    # Test score function
-    test_points = torch.tensor([[2.0, 2.0], [0.0, 0.0], [-2.0, -2.0]])
-    scores = landscape_four.score(test_points)
-    print(f"\n✓ Computed scores at test points")
-    print(f"  Score shape: {scores.shape}")

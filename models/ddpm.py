@@ -114,6 +114,40 @@ class MLPScoreNetwork(nn.Module):
         return h
 
 
+def _baoa_step(score_network, x, p, t, dt, gamma=0.1, m=1.0, kBT=1.0):
+    # OU parameters
+    a = math.exp(-gamma * dt)
+    sigma_p = math.sqrt((1.0 - a*a) * m * kBT)
+
+    # B
+    p = p + dt * (kBT * score_network(x, t))
+
+    # A
+    x = x + (dt / (2.0 * m)) * p
+
+    # O
+    eta = torch.randn_like(p)
+    p = a * p + sigma_p * eta
+
+    # A
+    x = x + (dt / (2.0 * m)) * p
+
+    return x, p
+
+def _baoa_sample(score_network, x, t, dt, n_steps=100, gamma=0.1, m=1.0, kBT=1.0):
+    if len(t.shape) == 0:
+        t = torch.stack([t]*x.shape[0])
+    elif t.shape[0] != x.shape[0]:
+        print("t (%s) and x (%s) not same shape" % (t.shape, x.shape))
+    
+    p = torch.zeros_like(x)
+    xtrj = [x.detach().clone()]
+    for n in np.arange(n_steps):
+        x,p = _baoa_step(score_network, x, p, t, dt, gamma=gamma, m=m, kBT=kBT)
+        xtrj.append(x.detach().clone())
+    xtrj = torch.stack(xtrj)
+    return xtrj
+
 class DDPM:
     """Denoising Diffusion Probabilistic Model."""
     
