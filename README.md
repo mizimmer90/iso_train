@@ -3,6 +3,10 @@
 This project implements a Denoising Diffusion Probabilistic Model (DDPM) trained on a 2D toy landscape, with iso-time simulations used for contrastive divergence during training.
 
 
+
+https://github.com/user-attachments/assets/9aa920d9-ff8c-46b8-8ea3-d1f8ebc83759
+
+
 https://github.com/user-attachments/assets/b61ac961-6371-44b4-b948-12cb3628b46f
 
 
