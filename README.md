@@ -18,13 +18,13 @@ The project explores using iso-time simulations as a contrastive divergence sign
 ```
 .
 ├── data/
-│   └── landscape.py          # 2D landscape generator with 4 Gaussian modes
+│   └── landscape.py          # 2D landscape generator (toy systems)
 ├── models/
 │   └── ddpm.py               # Core DDPM implementation
-├── training/                 # Training scripts (to be added)
-├── utils/                    # Utility functions (to be added)
-├── configs/                  # Configuration files (to be added)
-├── notebooks/                # Visualization notebooks (to be added)
+├── training/                 # Training scripts
+├── utils/                    # Utility functions
+├── configs/                  # Configuration files
+├── notebooks/                # Visualization notebooks
 ├── requirements.txt          # Python dependencies
 └── README.md                 # This file
 ```
@@ -35,52 +35,7 @@ The project explores using iso-time simulations as a contrastive divergence sign
 ```bash
 pip install -r requirements.txt
 ```
-
-2. (Optional) Generate landscape visualization:
+2. Local install
 ```bash
-python data/landscape.py
+pip install -e .
 ```
-
-## Usage
-
-### Generate Landscape
-
-```python
-from data.landscape import create_four_mode_landscape
-
-# Create landscape
-landscape = create_four_mode_landscape(scale=2.0, std=0.5)
-
-# Visualize
-landscape.visualize(save_path="landscape.png")
-
-# Sample data
-samples = landscape.sample(n_samples=1000)
-```
-
-### Create and Use DDPM
-
-```python
-from models.ddpm import DDPM, MLPScoreNetwork
-
-# Create score network
-score_network = MLPScoreNetwork(input_dim=2, hidden_dims=[128, 256, 256, 128])
-
-# Create DDPM (supports linear or cosine beta schedules)
-ddpm = DDPM(score_network, num_timesteps=1000, beta_schedule="cosine", device="cpu")
-
-# Compute loss for training
-loss = ddpm.loss(x_start)
-
-# Generate samples (trajectory returned; final sample at [-1])
-traj = ddpm.sample((batch_size, 2), mode="sde")  # or mode="ode" for deterministic sampling
-samples = traj[-1]
-```
-
-## Next Steps
-
-- Implement iso-time Langevin sampling
-- Add contrastive divergence training loop
-- Create training scripts
-- Add visualization utilities
-- Experiment with different noise schedules and architectures
