@@ -119,7 +119,6 @@ class MLPScoreNetwork(nn.Module):
         return h
 
 
-
 class DDPM:
     """Denoising Diffusion Probabilistic Model."""
     
@@ -216,6 +215,46 @@ class DDPM:
         pred_score = self.score(xt, t)
         return nn.functional.mse_loss(sigmas[:,None]*pred_score, -noise)
     
+    def loss_CD(self, xt, noise, t, n_steps=5, dt=0.01, gamma=0.1, m=1.0, kBT=1.0):
+        """
+        Compute Contrastive Divergence loss for EBM training.
+        
+        Performs n_steps of BAOA sampling, then computes the difference between
+        the EBM energy at the input xt and the energy after n_steps of BAOA.
+        
+        Args:
+            xt: Noisy data at time t, shape (batch_size, input_dim)
+            noise: The noise that was added (unused, kept for API consistency)
+            t: Time steps, shape (batch_size,)
+            n_steps: Number of BAOA steps to perform
+            dt: Time step for BAOA integration
+            gamma: Friction coefficient for BAOA
+            m: Mass for BAOA
+            kBT: Temperature (k_B * T) for BAOA
+        
+        Returns:
+            loss = mean(model(xt, t) - model(xt_out, t))
+            where xt_out is xt after n_steps of BAOA
+        """
+        # Compute energy at input xt (with gradients)
+        energy_input = self.model(xt, t)
+        
+        # Detach xt for BAOA sampling to prevent gradient tracking through trajectory
+        xt_detached = xt.detach()
+        
+        # Run BAOA sampling (internally detaches at each step)
+        trajectory = self.baoa_sample(xt_detached, t, dt, n_steps=n_steps, gamma=gamma, m=m, kBT=kBT)
+        
+        # Get the last frame of the trajectory
+        x_out = trajectory[-1]
+        
+        # Compute energy at output (gradients flow through model, not x_out)
+        energy_output = self.model(x_out, t)
+        
+        # Return mean difference
+        diff = energy_input - energy_output
+        return torch.mean(diff)
+    
     def _sde_step(self, xt, t, dt):
         beta_t = self._beta(t)
         score = self.score(xt, t)
@@ -291,7 +330,9 @@ class DDPM:
         xtrj = [x.detach().clone()]
         for n in np.arange(n_steps):
             x, p = self._baoa_step(x, p, t, dt, gamma=gamma, m=m, kBT=kBT)
-            xtrj.append(x.detach().clone())
+            x = x.detach().clone()
+            p = p.detach().clone()
+            xtrj.append(x)
         xtrj = torch.stack(xtrj)
         return xtrj
     

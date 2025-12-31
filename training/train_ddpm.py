@@ -56,6 +56,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-every", type=int, default=20, help="Save checkpoint every N epochs")
     parser.add_argument("--eval-every", type=int, default=1, help="Evaluate every N epochs")
     parser.add_argument("--continuous-loss", action="store_true", help="Use continuous-time loss")
+    
+    # Contrastive divergence
+    parser.add_argument("--contrastive-scale", type=float, default=0.0, help="Scale for contrastive divergence loss (0 to disable)")
 
     return parser.parse_args()
 
@@ -132,8 +135,14 @@ def train_epoch(ddpm: DDPM, loader: DataLoader, optim: torch.optim.Optimizer, de
         # Forward diffusion: get noisy sample and noise
         xt, noise = ddpm.q_forward(x, t)
         
-        # Compute loss
+        # Compute base loss
         loss = ddpm.loss(xt, noise, t)
+        
+        # Add contrastive divergence loss if enabled
+        if args.contrastive_scale > 0:
+            loss_CD = ddpm.loss_CD(xt, noise, t)
+            loss = loss + args.contrastive_scale * loss_CD
+        
         if not torch.isfinite(loss):
             raise ValueError(f"Non-finite loss encountered: {loss.item()}")
         loss.backward()
