@@ -70,7 +70,7 @@ class MLPScoreNetwork(nn.Module):
         # Build MLP layers (no time embedding concatenation)
         dims = [input_dim] + hidden_dims + [input_dim]
         if ebm:
-            dims[-1] = 1  # Output scalar energy for EBM mode
+            dims[-1] = 1
 
         self.layers = nn.ModuleList()
         
@@ -216,9 +216,11 @@ class DDPM:
             Tensor of shape (batch_size, input_dim) with predicted scores
         """
         if self.ebm:
-            x.requires_grad_(True)
-            E = self.model(x, t)
-            score = torch.autograd.grad(E.sum(), x, create_graph=True)[0]
+            # Need gradients for input x to compute score, even in eval/no_grad context
+            x = x.detach().requires_grad_(True)
+            with torch.enable_grad():
+                E = self.model(x, t)
+                score = torch.autograd.grad(E.sum(), x, create_graph=self.model.training)[0]
             return score
         else:
             return self.model(x, t)
