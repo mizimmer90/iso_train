@@ -39,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dims", type=int, nargs="+", default=[128, 256, 256, 128], help="MLP hidden sizes")
     parser.add_argument("--time-embed-dim", type=int, default=128, help="Time embedding dimension")
     parser.add_argument("--dropout", type=float, default=0.0, help="Dropout rate in the MLP score network")
+    parser.add_argument("--ebm", action="store_true", help="Use energy-based model (score computed via gradient)")
     parser.add_argument("--beta-min", type=float, default=0.2, help="Noise schedule minimum")
     parser.add_argument("--beta-max", type=float, default=20.0, help="Noise schedule maximum")
     parser.add_argument("--beta-schedule", type=str, default="linear", choices=["linear", "cosine"], help="Noise schedule type")
@@ -108,14 +109,14 @@ def log_metrics(run_dir: Path, metrics: Dict) -> None:
 def save_checkpoint(run_dir: Path, epoch: int, ddpm: DDPM, optim: torch.optim.Optimizer) -> None:
     ckpt = {
         "epoch": epoch,
-        "model": ddpm.score_network.state_dict(),
+        "model": ddpm.model.state_dict(),
         "optimizer": optim.state_dict(),
     }
     torch.save(ckpt, run_dir / "checkpoints" / f"epoch_{epoch:04d}.pt")
 
 
 def train_epoch(ddpm: DDPM, loader: DataLoader, optim: torch.optim.Optimizer, device: torch.device, args: argparse.Namespace) -> Tuple[float, float]:
-    ddpm.score_network.train()
+    ddpm.model.train()
     total_loss = 0.0
     steps = 0
     grad_norm_sum = 0.0
@@ -137,15 +138,15 @@ def train_epoch(ddpm: DDPM, loader: DataLoader, optim: torch.optim.Optimizer, de
             raise ValueError(f"Non-finite loss encountered: {loss.item()}")
         loss.backward()
         if args.grad_clip and args.grad_clip > 0:
-            grad_norm = torch.nn.utils.clip_grad_norm_(ddpm.score_network.parameters(), args.grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(ddpm.model.parameters(), args.grad_clip)
         else:
-            grads = [p.grad for p in ddpm.score_network.parameters() if p.grad is not None]
+            grads = [p.grad for p in ddpm.model.parameters() if p.grad is not None]
             grad_norm = torch.norm(torch.stack([g.detach().data.norm(2) for g in grads]), 2) if grads else torch.tensor(0.0, device=device)
         if not torch.isfinite(grad_norm):
             raise ValueError(f"Non-finite gradient norm encountered: {grad_norm}")
         optim.step()
         # Check parameter finiteness
-        for p in ddpm.score_network.parameters():
+        for p in ddpm.model.parameters():
             if not torch.isfinite(p).all():
                 raise ValueError("Non-finite parameter value encountered during training.")
 
@@ -158,7 +159,7 @@ def train_epoch(ddpm: DDPM, loader: DataLoader, optim: torch.optim.Optimizer, de
 
 @torch.no_grad()
 def evaluate(ddpm: DDPM, loader: DataLoader, device: torch.device, args: argparse.Namespace) -> float:
-    ddpm.score_network.eval()
+    ddpm.model.eval()
     total_loss = 0.0
     steps = 0
     for (x,) in loader:
@@ -177,7 +178,7 @@ def evaluate(ddpm: DDPM, loader: DataLoader, device: torch.device, args: argpars
             raise ValueError(f"Non-finite loss encountered during evaluation: {loss.item()}")
         total_loss += loss.item()
         steps += 1
-    ddpm.score_network.train()
+    ddpm.model.train()
     return total_loss / max(steps, 1)
 
 
@@ -195,21 +196,23 @@ def main() -> None:
 
     train_loader, val_loader = make_dataloaders(args)
 
-    score_network = MLPScoreNetwork(
+    model = MLPScoreNetwork(
         input_dim=2,
         hidden_dims=args.hidden_dims,
         time_embed_dim=args.time_embed_dim,
         dropout=args.dropout,
+        ebm=args.ebm,
     )
     ddpm = DDPM(
-        score_network,
+        model,
+        ebm=args.ebm,
         beta_min=args.beta_min,
         beta_max=args.beta_max,
         beta_schedule=args.beta_schedule,
         device=str(device),
     )
 
-    optimizer = torch.optim.Adam(ddpm.score_network.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.Adam(ddpm.model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     # Log uninitialized (epoch 0) losses
     init_train_loss = evaluate(ddpm, train_loader, device, args)

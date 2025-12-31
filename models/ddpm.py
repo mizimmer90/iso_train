@@ -70,7 +70,7 @@ class MLPScoreNetwork(nn.Module):
         # Build MLP layers (no time embedding concatenation)
         dims = [input_dim] + hidden_dims + [input_dim]
         if ebm:
-            dim = dims + 1
+            dims[-1] = 1  # Output scalar energy for EBM mode
 
         self.layers = nn.ModuleList()
         
@@ -159,7 +159,8 @@ class DDPM:
     
     def __init__(
         self,
-        score_network: nn.Module,
+        model: nn.Module,
+        ebm: bool = False,
         beta_min: float = 0.2,
         beta_max: float = 20,
         beta_schedule: str = "linear",
@@ -169,13 +170,15 @@ class DDPM:
         Initialize DDPM.
         
         Args:
-            score_network: Neural network for predicting scores
+            model: Neural network for predicting scores (or energy if ebm=True)
+            ebm: If True, model outputs energy (scalar) and score is computed via gradient
             beta_min: Starting noise schedule value
             beta_max: Ending noise schedule value
             beta_schedule: Noise schedule type ("linear" or "cosine")
             device: Device to run on
         """
-        self.score_network = score_network.to(device)
+        self.model = model.to(device)
+        self.ebm = ebm
         self.device = device
         self.beta_schedule = beta_schedule.lower()
         
@@ -198,125 +201,12 @@ class DDPM:
             alpha = self._alpha(t)
         return torch.sqrt(1 - (alpha * alpha))
     
-    def q_forward(self, x0, t, noise=None):
-        if noise is None:
-            noise = torch.randn_like(x0)
-        
-        alpha = self._alpha(t)
-        sigma = self._sigma(t, alpha=alpha)
-        xt = alpha[:,None]*x0 + sigma[:,None]*noise
-        return xt, noise
-    
-    def loss(self, xt, noise, t):
+    def score(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """
-        Compute the training loss.
+        Compute the score function.
         
-        Args:
-            xt: Noisy data at time t, shape (batch_size, input_dim)
-            noise: The noise that was added, shape (batch_size, input_dim)
-            t: Time steps, shape (batch_size,)
-        
-        Returns:
-            loss = ||sigma(t)*score(xt,t) + noise||^2
-        """
-        sigmas = self._sigma(t)
-        pred_score = self.score_network(xt, t)
-        return nn.functional.mse_loss(sigmas[:,None]*pred_score, -noise)
-    
-    def _sde_step(self, xt, t, dt):
-        beta_t = self._beta(t)
-        score = self.score_network(xt, t)
-        noise = torch.randn_like(xt)
-        drift = (-0.5*beta_t[:,None]*xt) - (beta_t[:,None]*score)
-        xt = xt + drift*dt + torch.sqrt(beta_t[:,None]*np.abs(dt))*noise
-        return xt
-    
-    def _ode_step(self, xt, t, dt):
-        beta_t = self._beta(t)
-        score = self.score_network(xt, t)
-        drift = -0.5*(beta_t[:, None]*xt + beta_t[:, None]*score)
-        xt = xt + drift*dt
-        return xt
-    
-    def sample(self, xt, tspan=(1, 0), n_steps=200, mode='sde'):
-        self.score_network.eval()
-        b = xt.shape[0]
-
-        times = np.linspace(tspan[0], tspan[1], n_steps + 1)  # include endpoints
-        traj = [xt]
-
-        for i in range(n_steps):
-            t_tmp = times[i]
-            dt = times[i+1] - times[i]   # this will be NEGATIVE for 1 -> 0
-            t = torch.full((b,), float(t_tmp), dtype=xt.dtype, device=xt.device)
-
-            if mode == 'sde':
-                xt = self._sde_step(xt, t, dt)
-            elif mode == 'ode':
-                xt = self._ode_step(xt, t, dt)
-            else:
-                raise ValueError("unrecognized mode")
-
-            traj.append(xt)
-
-        return torch.stack(traj)
-
-
-    def predict(self, xt, t):
-        alpha = self._alpha(t)
-        sigma = self._sigma(t, alpha=alpha)
-        score = self.score_network(xt, t)
-        x0 = (xt + (sigma[:,None]*sigma[:,None ])*score)/alpha[:,None]
-        return x0
-
-
-class DDPM_EBM:
-    """Denoising Diffusion Probabilistic Model."""
-    
-    def __init__(
-        self,
-        energy_network: nn.Module,
-        beta_min: float = 0.2,
-        beta_max: float = 20,
-        beta_schedule: str = "linear",
-        device: str = "cpu",
-    ):
-        """
-        Initialize DDPM.
-        
-        Args:
-            energy_network: Neural network for predicting energy (scalar output)
-            beta_min: Starting noise schedule value
-            beta_max: Ending noise schedule value
-            beta_schedule: Noise schedule type ("linear" or "cosine")
-            device: Device to run on
-        """
-        self.energy_network = energy_network.to(device)
-        self.device = device
-        self.beta_schedule = beta_schedule.lower()
-        
-        self.beta_min = beta_min
-        self.beta_max = beta_max
-        
-    def _Beta(self, t):
-        return self.beta_min * t + 0.5 *(self.beta_max - self.beta_min) * (t * t)
-    
-    def _beta(self,t):
-        return self.beta_min + (self.beta_max - self.beta_min) * t
-
-    def _alpha(self, t, Beta=None):
-        if Beta is None:
-            Beta = self._Beta(t)
-        return torch.exp(-0.5*Beta)
-
-    def _sigma(self, t, alpha=None):
-        if alpha is None:
-            alpha = self._alpha(t)
-        return torch.sqrt(1 - (alpha * alpha))
-    
-    def _score(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """
-        Compute the score function from the energy network.
+        For non-EBM mode: returns model(x, t) directly.
+        For EBM mode: computes gradient of energy model(x, t) with respect to x.
         
         Args:
             x: Tensor of shape (batch_size, input_dim) with noisy data
@@ -325,10 +215,13 @@ class DDPM_EBM:
         Returns:
             Tensor of shape (batch_size, input_dim) with predicted scores
         """
-        x.requires_grad_(True)
-        E = self.energy_network(x, t)
-        score = torch.autograd.grad(E.sum(), x, create_graph=True)[0]
-        return score
+        if self.ebm:
+            x.requires_grad_(True)
+            E = self.model(x, t)
+            score = torch.autograd.grad(E.sum(), x, create_graph=True)[0]
+            return score
+        else:
+            return self.model(x, t)
     
     def q_forward(self, x0, t, noise=None):
         if noise is None:
@@ -352,12 +245,12 @@ class DDPM_EBM:
             loss = ||sigma(t)*score(xt,t) + noise||^2
         """
         sigmas = self._sigma(t)
-        pred_score = self._score(xt, t)
+        pred_score = self.score(xt, t)
         return nn.functional.mse_loss(sigmas[:,None]*pred_score, -noise)
     
     def _sde_step(self, xt, t, dt):
         beta_t = self._beta(t)
-        score = self._score(xt, t)
+        score = self.score(xt, t)
         noise = torch.randn_like(xt)
         drift = (-0.5*beta_t[:,None]*xt) - (beta_t[:,None]*score)
         xt = xt + drift*dt + torch.sqrt(beta_t[:,None]*np.abs(dt))*noise
@@ -365,13 +258,13 @@ class DDPM_EBM:
     
     def _ode_step(self, xt, t, dt):
         beta_t = self._beta(t)
-        score = self._score(xt, t)
+        score = self.score(xt, t)
         drift = -0.5*(beta_t[:, None]*xt + beta_t[:, None]*score)
         xt = xt + drift*dt
         return xt
     
     def sample(self, xt, tspan=(1, 0), n_steps=200, mode='sde'):
-        self.energy_network.eval()
+        self.model.eval()
         b = xt.shape[0]
 
         times = np.linspace(tspan[0], tspan[1], n_steps + 1)  # include endpoints
@@ -397,6 +290,6 @@ class DDPM_EBM:
     def predict(self, xt, t):
         alpha = self._alpha(t)
         sigma = self._sigma(t, alpha=alpha)
-        score = self._score(xt, t)
+        score = self.score(xt, t)
         x0 = (xt + (sigma[:,None]*sigma[:,None ])*score)/alpha[:,None]
         return x0
